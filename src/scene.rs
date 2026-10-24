@@ -50,6 +50,9 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    /// Scratch space of [`Self::finish`], kept across frames so that sorting allocates nothing
+    /// once it has grown to the busiest frame.
+    sort_keys: Vec<SortEntry>,
 }
 
 #[expect(missing_docs)]
@@ -149,17 +152,28 @@ impl Scene {
     }
 
     pub fn finish(&mut self) {
-        self.shadows.sort_by_key(|shadow| shadow.order);
-        self.quads.sort_by_key(|quad| quad.order);
-        self.paths.sort_by_key(|path| path.order);
-        self.underlines.sort_by_key(|underline| underline.order);
-        self.monochrome_sprites
-            .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
-        self.subpixel_sprites
-            .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
-        self.polychrome_sprites
-            .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
-        self.surfaces.sort_by_key(|surface| surface.order);
+        // Every kind is sorted by draw order, and exactly as a stable sort would: primitives of
+        // one order may overlap (`paint_layer` gives all of a layer's primitives the layer's
+        // order, without asking the bounds tree), and their insertion order is then what is
+        // drawn on top. `slice::sort_by_key` is stable but allocates scratch space for any slice
+        // over about 4 KB, every frame; `stable_sort_by_key` keeps its scratch in the scene.
+        let keys = &mut self.sort_keys;
+        stable_sort_by_key(&mut self.shadows, keys, |shadow| (shadow.order, 0, 0));
+        stable_sort_by_key(&mut self.quads, keys, |quad| (quad.order, 0, 0));
+        stable_sort_by_key(&mut self.paths, keys, |path| (path.order, 0, 0));
+        stable_sort_by_key(&mut self.underlines, keys, |underline| {
+            (underline.order, 0, 0)
+        });
+        stable_sort_by_key(&mut self.monochrome_sprites, keys, |sprite| {
+            (sprite.order, 0, sprite.tile.tile_id.0)
+        });
+        stable_sort_by_key(&mut self.subpixel_sprites, keys, |sprite| {
+            (sprite.order, 0, sprite.tile.tile_id.0)
+        });
+        stable_sort_by_key(&mut self.polychrome_sprites, keys, |sprite| {
+            (sprite.order, 0, sprite.tile.tile_id.0)
+        });
+        stable_sort_by_key(&mut self.surfaces, keys, |surface| (surface.order, 0, 0));
     }
 
     #[cfg_attr(
@@ -188,6 +202,44 @@ impl Scene {
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
         }
+    }
+}
+
+/// A primitive's sort key and its index before sorting. The key is the draw order, then two
+/// more numbers for kinds that want to be grouped further.
+type SortEntry = ((DrawOrder, u32, u32), u32);
+
+/// Sorts `items` by `key`, keeping the order of equal keys, without allocating once `entries`
+/// has grown to the length of the longest slice sorted with it.
+///
+/// The keys are sorted with their index in `items` as the last tie-break, so the (unstable)
+/// sort of the entries is deterministic and equals a stable one. The items then move into
+/// place by swaps, the way `slice::sort_by_cached_key` does it.
+fn stable_sort_by_key<T>(
+    items: &mut [T],
+    entries: &mut Vec<SortEntry>,
+    key: impl Fn(&T) -> (DrawOrder, u32, u32),
+) {
+    entries.clear();
+    entries.extend(
+        items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| (key(item), index as u32)),
+    );
+    // Most frames add primitives in order, or nearly: skip the work when nothing moves.
+    if entries.is_sorted() {
+        return;
+    }
+    entries.sort_unstable();
+    for position in 0..items.len() {
+        let mut source = entries[position].1 as usize;
+        // The item that belongs here may have been swapped away already: follow where it went.
+        while source < position {
+            source = entries[source].1 as usize;
+        }
+        entries[position].1 = source as u32;
+        items.swap(position, source);
     }
 }
 
@@ -945,5 +997,97 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::size;
+
+    fn quad_at(x: f32) -> Quad {
+        let bounds = Bounds {
+            origin: point(ScaledPixels(x), ScaledPixels(0.)),
+            size: size(ScaledPixels(100.), ScaledPixels(10.)),
+        };
+        Quad {
+            bounds,
+            content_mask: ContentMask { bounds },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn matches_a_stable_sort() {
+        // A deterministic pseudo-random sequence with many ties.
+        let mut state = 0x2545_f491_u32;
+        let mut next = move |modulo: u32| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state % modulo
+        };
+        let mut entries = Vec::new();
+        for len in [0, 1, 2, 3, 17, 500, 5000] {
+            let items: Vec<(u32, u32, u32, usize)> = (0..len)
+                .map(|index| (next(7), next(3), next(5), index))
+                .collect();
+            let mut expected = items.clone();
+            expected.sort_by_key(|item| (item.0, item.1, item.2));
+            let mut sorted = items;
+            stable_sort_by_key(&mut sorted, &mut entries, |item| (item.0, item.1, item.2));
+            assert_eq!(sorted, expected, "{len} items");
+        }
+    }
+
+    #[test]
+    fn primitives_of_one_layer_keep_their_insertion_order() {
+        let mut scene = Scene::default();
+        let rect = Bounds {
+            origin: point(ScaledPixels(0.), ScaledPixels(0.)),
+            size: size(ScaledPixels(400.), ScaledPixels(10.)),
+        };
+        scene.push_layer(rect);
+        // An overlapping layer gets a higher order, and its quads come first in the vector.
+        scene.push_layer(rect);
+        scene.insert_primitive(quad_at(-1.));
+        scene.pop_layer();
+        // The outer layer's quads overlap each other but share the layer's order.
+        for index in 0..300 {
+            scene.insert_primitive(quad_at(index as f32));
+        }
+        scene.pop_layer();
+
+        scene.finish();
+        let xs: Vec<f32> = scene
+            .quads
+            .iter()
+            .map(|quad| quad.bounds.origin.x.0)
+            .collect();
+        let expected: Vec<f32> = (0..300).map(|index| index as f32).chain([-1.]).collect();
+        assert_eq!(xs, expected);
+    }
+
+    #[test]
+    fn sorting_allocates_nothing_after_the_first_frame() {
+        let mut scene = Scene::default();
+        let mut capacities = Vec::new();
+        for _ in 0..3 {
+            scene.clear();
+            let rect = quad_at(0.).bounds;
+            scene.push_layer(rect);
+            scene.push_layer(rect);
+            scene.insert_primitive(quad_at(-1.));
+            scene.pop_layer();
+            for index in 0..2000 {
+                scene.insert_primitive(quad_at(index as f32));
+            }
+            scene.pop_layer();
+            scene.finish();
+            capacities.push(scene.sort_keys.capacity());
+        }
+        assert!(capacities[0] >= 2001);
+        assert_eq!(capacities[0], capacities[1]);
+        assert_eq!(capacities[1], capacities[2]);
     }
 }
