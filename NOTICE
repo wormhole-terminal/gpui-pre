@@ -6,8 +6,8 @@ The first commit of this repository is that crate unchanged. The commits after i
 the Wormhole project (https://github.com/wormhole-terminal) and change these files, which carry
 a notice at their top (Apache-2.0, section 4(b)):
 
-  src/scene.rs             the scene's sort: stable without a per-frame allocation, sprites
-                           grouped by atlas texture
+  src/scene.rs             the scene's sort: stable without a per-frame allocation (a counting
+                           sort by draw order), sprites grouped by atlas texture
   src/view.rs              a cached view records and replays its accessibility nodes; tests
   src/window.rs            the same for elements drawn through `deferred`; the test-support
                            methods simulate_a11y_active, simulate_a11y_action and

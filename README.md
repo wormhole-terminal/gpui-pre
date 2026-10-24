@@ -6,9 +6,10 @@ published; `NOTICE` lists the files the next ones modify, as the license asks (s
 
 1. **An allocation-free stable scene sort** (`src/scene.rs`). `Scene::finish` sorted with
    `slice::sort_by_key`, which allocates scratch space for any slice over about 4 KB in every
-   frame (3.3 to 3.6 MB a frame for a full-window truecolor terminal). The sort now keeps its
-   scratch in the `Scene`, allocates only when a frame is larger than any before, and orders
-   exactly as the stable sort did: primitives of one layer share a draw order and may overlap, so
+   frame (3.3 to 3.6 MB a frame for a full-window truecolor terminal). The sort is now a counting
+   sort by draw order that keeps its scratch in the `Scene` (a few passes over a frame's
+   primitives, which are nearly in order already), allocates only when a frame is larger than
+   any before, and orders exactly as the stable sort did: primitives of one layer share a draw order and may overlap, so
    ties must keep their insertion order. Sprites of one order are also grouped by atlas texture
    (the idea of zed-industries/zed#65814).
 2. **Accessibility replay for cached views** (`src/view.rs`, `src/window.rs`,
