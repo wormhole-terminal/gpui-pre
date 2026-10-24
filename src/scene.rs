@@ -157,6 +157,10 @@ impl Scene {
         // order, without asking the bounds tree), and their insertion order is then what is
         // drawn on top. `slice::sort_by_key` is stable but allocates scratch space for any slice
         // over about 4 KB, every frame; `stable_sort_by_key` keeps its scratch in the scene.
+        //
+        // Sprites of one order go by atlas texture next (tile ids are only unique within a
+        // texture), so a batch, which ends where the texture changes, isn't cut by tiles of two
+        // textures alternating.
         let keys = &mut self.sort_keys;
         stable_sort_by_key(&mut self.shadows, keys, |shadow| (shadow.order, 0, 0));
         stable_sort_by_key(&mut self.quads, keys, |quad| (quad.order, 0, 0));
@@ -165,13 +169,13 @@ impl Scene {
             (underline.order, 0, 0)
         });
         stable_sort_by_key(&mut self.monochrome_sprites, keys, |sprite| {
-            (sprite.order, 0, sprite.tile.tile_id.0)
+            sprite_key(sprite.order, &sprite.tile)
         });
         stable_sort_by_key(&mut self.subpixel_sprites, keys, |sprite| {
-            (sprite.order, 0, sprite.tile.tile_id.0)
+            sprite_key(sprite.order, &sprite.tile)
         });
         stable_sort_by_key(&mut self.polychrome_sprites, keys, |sprite| {
-            (sprite.order, 0, sprite.tile.tile_id.0)
+            sprite_key(sprite.order, &sprite.tile)
         });
         stable_sort_by_key(&mut self.surfaces, keys, |surface| (surface.order, 0, 0));
     }
@@ -205,9 +209,12 @@ impl Scene {
     }
 }
 
-/// A primitive's sort key and its index before sorting. The key is the draw order, then two
-/// more numbers for kinds that want to be grouped further.
+/// A primitive's sort key (draw order, atlas texture, tile) and its index before sorting.
 type SortEntry = ((DrawOrder, u32, u32), u32);
+
+fn sprite_key(order: DrawOrder, tile: &AtlasTile) -> (DrawOrder, u32, u32) {
+    (order, tile.texture_id.index, tile.tile_id.0)
+}
 
 /// Sorts `items` by `key`, keeping the order of equal keys, without allocating once `entries`
 /// has grown to the length of the longest slice sorted with it.
@@ -1003,7 +1010,7 @@ impl PathVertex<Pixels> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::size;
+    use crate::{DevicePixels, TileId, size};
 
     fn quad_at(x: f32) -> Quad {
         let bounds = Bounds {
@@ -1066,6 +1073,44 @@ mod tests {
             .collect();
         let expected: Vec<f32> = (0..300).map(|index| index as f32).chain([-1.]).collect();
         assert_eq!(xs, expected);
+    }
+
+    #[test]
+    fn sprites_of_one_order_are_grouped_by_texture() {
+        let tile = |texture: u32, tile: u32| AtlasTile {
+            texture_id: AtlasTextureId {
+                index: texture,
+                kind: crate::AtlasTextureKind::Monochrome,
+            },
+            tile_id: TileId(tile),
+            padding: 0,
+            bounds: Bounds::<DevicePixels>::default(),
+        };
+        let mut scene = Scene::default();
+        let rect = Bounds {
+            origin: point(ScaledPixels(0.), ScaledPixels(0.)),
+            size: size(ScaledPixels(100.), ScaledPixels(10.)),
+        };
+        scene.push_layer(rect);
+        for (texture, tile_id) in [(1, 5), (0, 5), (1, 2), (0, 2), (1, 5)] {
+            scene.insert_primitive(MonochromeSprite {
+                order: 0,
+                pad: 0,
+                bounds: rect,
+                content_mask: ContentMask { bounds: rect },
+                color: Hsla::default(),
+                tile: tile(texture, tile_id),
+                transformation: TransformationMatrix::unit(),
+            });
+        }
+        scene.pop_layer();
+        scene.finish();
+        let sorted: Vec<(u32, u32)> = scene
+            .monochrome_sprites
+            .iter()
+            .map(|sprite| (sprite.tile.texture_id.index, sprite.tile.tile_id.0))
+            .collect();
+        assert_eq!(sorted, [(0, 2), (0, 5), (1, 2), (1, 5), (1, 5)]);
     }
 
     #[test]
