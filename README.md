@@ -1,3 +1,43 @@
+# gpui-pre 0.3.9 with two patches for Wormhole
+
+This is [Wormhole](https://github.com/wormhole-terminal/wormhole)'s copy of the `gpui-pre` 0.3.9
+crate (Zed's GPUI, Apache-2.0), with two changes it needs. The first commit is the crate as
+published; `NOTICE` lists the files the next ones modify, as the license asks (section 4(b)).
+
+1. **An allocation-free stable scene sort** (`src/scene.rs`). `Scene::finish` sorted with
+   `slice::sort_by_key`, which allocates scratch space for any slice over about 4 KB in every
+   frame (3.3 to 3.6 MB a frame for a full-window truecolor terminal). The sort now keeps its
+   scratch in the `Scene`, allocates only when a frame is larger than any before, and orders
+   exactly as the stable sort did: primitives of one layer share a draw order and may overlap, so
+   ties must keep their insertion order. Sprites of one order are also grouped by atlas texture
+   (the idea of zed-industries/zed#65814).
+2. **Accessibility replay for cached views** (`src/view.rs`, `src/window.rs`,
+   `src/window/a11y.rs`). A view made with `.cached(...)` that is reused skips its prepaint, so
+   its accessibility nodes and action listeners were missing from the tree that GPUI rebuilds in
+   every frame while an assistive technology is connected. The view's prepaint now records the
+   nodes it added (also for elements drawn through `deferred`, such as popovers) and a reused frame
+   replays them, with their listeners.
+
+## Using it
+
+```toml
+[patch.crates-io]
+gpui-pre = { git = "https://github.com/wormhole-terminal/gpui-pre", rev = "<commit>" }
+```
+
+The version is still 0.3.9, so the patch replaces the crate for everything that depends on it
+(`gpui-kit`, `gpui-component`, ...). Pin a `rev`; `main` only ever moves forward.
+
+## Dropping the fork
+
+When a `gpui-pre` release contains both changes (or Zed's `gpui` does, and `gpui-kit` moved to
+it), delete the `[patch.crates-io]` entry, run `cargo update -p gpui-pre`, and archive this
+repository. Until then the changes are offered upstream to zed-industries/zed.
+
+The original README follows.
+
+---
+
 # Welcome to GPUI!
 
 GPUI is a hybrid immediate and retained mode, GPU accelerated, UI framework

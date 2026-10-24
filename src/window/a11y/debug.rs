@@ -1,3 +1,4 @@
+// Modified by the Wormhole project (wormhole-terminal/gpui-pre), see NOTICE.
 //! Developer tooling for inspecting the accessibility tree.
 //!
 //! [`A11yDebug`] retains the last [`TreeUpdate`] sent to the platform adapter so

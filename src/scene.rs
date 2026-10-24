@@ -1,3 +1,4 @@
+// Modified by the Wormhole project (wormhole-terminal/gpui-pre), see NOTICE.
 // todo("windows"): remove
 #![cfg_attr(windows, allow(dead_code))]
 

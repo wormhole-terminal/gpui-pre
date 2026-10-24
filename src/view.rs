@@ -1,3 +1,4 @@
+// Modified by the Wormhole project (wormhole-terminal/gpui-pre), see NOTICE.
 use crate::{
     AnyElement, AnyEntity, AnyWeakEntity, App, AvailableSpace, Bounds, ContentMask, Context,
     Element, ElementId, Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement,

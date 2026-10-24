@@ -1,3 +1,4 @@
+// Modified by the Wormhole project (wormhole-terminal/gpui-pre), see NOTICE.
 #[cfg(feature = "profiler")]
 use crate::DebugFrameOverlayMode;
 #[cfg(any(feature = "inspector", debug_assertions))]

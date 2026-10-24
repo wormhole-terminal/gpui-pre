@@ -1,3 +1,4 @@
+// Modified by the Wormhole project (wormhole-terminal/gpui-pre), see NOTICE.
 //! Accessibility support, provided by [AccessKit][accesskit].
 //!
 //! There are user-facing guide-level docs [here](crate::_accessibility).
