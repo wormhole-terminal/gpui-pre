@@ -11,7 +11,7 @@ published; `NOTICE` lists the files the next ones modify, as the license asks (s
    primitives, which are nearly in order already), allocates only when a frame is larger than
    any before, and orders exactly as the stable sort did: primitives of one layer share a draw order and may overlap, so
    ties must keep their insertion order. Sprites of one order are also grouped by atlas texture
-   (the idea of zed-industries/zed#65814).
+   (as Zed's main does since zed-industries/zed#65814).
 2. **Accessibility replay for cached views** (`src/view.rs`, `src/window.rs`,
    `src/window/a11y.rs`). A view made with `.cached(...)` that is reused skips its prepaint, so
    its accessibility nodes and action listeners were missing from the tree that GPUI rebuilds in

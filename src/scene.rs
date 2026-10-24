@@ -168,37 +168,39 @@ impl Scene {
             subpixel_sprites,
             polychrome_sprites,
         } = &mut self.sort_scratch;
-        sort_by_order(&mut self.shadows, shadows, counts, entries, |s| s.order);
-        sort_by_order(&mut self.quads, quads, counts, entries, |q| q.order);
+        sort_by_order(&mut self.shadows, shadows, counts, entries, |s| {
+            (s.order, 0)
+        });
+        sort_by_order(&mut self.quads, quads, counts, entries, |q| (q.order, 0));
         sort_by_order(&mut self.underlines, underlines, counts, entries, |u| {
-            u.order
+            (u.order, 0)
         });
         // Few, and not `Copy`: by (order, insertion index).
         stable_sort_by_key(&mut self.paths, entries, |path| (path.order, 0, 0));
         stable_sort_by_key(&mut self.surfaces, entries, |surface| (surface.order, 0, 0));
-        // Sprites of one order go by atlas texture next (tile ids are only unique within a
-        // texture), so a batch, which ends where the texture changes, isn't cut by tiles of two
-        // textures alternating.
-        sort_sprites(
+        // Sprites of one order go by atlas texture next, so a batch, which ends where the
+        // texture changes, isn't cut by sprites of two textures alternating (the tile within a
+        // texture doesn't matter to a batch).
+        sort_by_order(
             &mut self.monochrome_sprites,
             monochrome_sprites,
             counts,
             entries,
-            |s| sprite_key(s.order, &s.tile),
+            |s| (s.order, s.tile.texture_id.index),
         );
-        sort_sprites(
+        sort_by_order(
             &mut self.subpixel_sprites,
             subpixel_sprites,
             counts,
             entries,
-            |s| sprite_key(s.order, &s.tile),
+            |s| (s.order, s.tile.texture_id.index),
         );
-        sort_sprites(
+        sort_by_order(
             &mut self.polychrome_sprites,
             polychrome_sprites,
             counts,
             entries,
-            |s| sprite_key(s.order, &s.tile),
+            |s| (s.order, s.tile.texture_id.index),
         );
     }
 
@@ -248,48 +250,55 @@ struct SortScratch {
     polychrome_sprites: Vec<PolychromeSprite>,
 }
 
-/// A primitive's sort key (draw order, atlas texture, tile) and its index before sorting.
+/// A primitive's sort key (draw order and two more numbers) and its index before sorting.
 type SortEntry = ((DrawOrder, u32, u32), u32);
 
-fn sprite_key(order: DrawOrder, tile: &AtlasTile) -> (DrawOrder, u32, u32) {
-    (order, tile.texture_id.index, tile.tile_id.0)
-}
-
-/// Sorts `items` by `order`, keeping the order of equal keys, with a counting sort: draw orders
-/// are small numbers (the bounds tree hands them out one by one), so this takes a few passes
-/// over the primitives however they are arranged. `spare` and `counts` are scratch space.
+/// Sorts `items` by `key` (a draw order and a number below it, such as an atlas texture),
+/// keeping the order of equal keys, with a counting sort: draw orders are small numbers (the
+/// bounds tree hands them out one by one) and there are few textures, so this takes a few
+/// passes over the primitives however they are arranged. `spare`, `counts` and `entries` are
+/// scratch space.
 fn sort_by_order<T: Copy>(
     items: &mut Vec<T>,
     spare: &mut Vec<T>,
     counts: &mut Vec<u32>,
     entries: &mut Vec<SortEntry>,
-    order: impl Fn(&T) -> DrawOrder,
+    key: impl Fn(&T) -> (DrawOrder, u32),
 ) {
-    let mut max = 0;
-    let mut previous = 0;
+    let mut max = (0, 0);
+    let mut previous = (0, 0);
     let mut sorted = true;
     for item in items.iter() {
-        let order = order(item);
-        sorted &= order >= previous;
-        previous = order;
-        max = max.max(order);
+        let key = key(item);
+        sorted &= key >= previous;
+        previous = key;
+        max = (max.0.max(key.0), max.1.max(key.1));
     }
     // Most frames add primitives in order, or nearly: nothing to do for an ordered one.
     if sorted {
         return;
     }
-    // Orders are handed out one by one, so `max` is about the number of primitives. A frame
+    // Orders are handed out one by one, so `max.0` is about the number of primitives. A frame
     // with a few primitives of huge orders would make the counts bigger than it is worth.
-    if max as usize > items.len().saturating_mul(8).saturating_add(1024) {
-        stable_sort_by_key(items, entries, |item| (order(item), 0, 0));
+    let width = max.1 as usize + 1;
+    let buckets = (max.0 as usize + 1).saturating_mul(width);
+    if buckets > items.len().saturating_mul(8).saturating_add(1024) {
+        stable_sort_by_key(items, entries, |item| {
+            let key = key(item);
+            (key.0, key.1, 0)
+        });
         return;
     }
+    let bucket = |item: &T| {
+        let key = key(item);
+        key.0 as usize * width + key.1 as usize
+    };
     counts.clear();
-    counts.resize(max as usize + 1, 0);
+    counts.resize(buckets, 0);
     for item in items.iter() {
-        counts[order(item) as usize] += 1;
+        counts[bucket(item)] += 1;
     }
-    // Each count becomes the position where the first primitive of that order goes.
+    // Each count becomes the position where the first primitive of that bucket goes.
     let mut position = 0;
     for count in counts.iter_mut() {
         position += mem::replace(count, position);
@@ -301,34 +310,12 @@ fn sort_by_order<T: Copy>(
         spare.resize(len, items[0]);
     }
     for item in items.iter() {
-        let next = &mut counts[order(item) as usize];
+        let next = &mut counts[bucket(item)];
         spare[*next as usize] = *item;
         *next += 1;
     }
     mem::swap(items, spare);
     items.truncate(len);
-}
-
-/// Sorts sprites by `key` (order, texture, tile), keeping the order of equal keys: by order
-/// first, then each run of one order by the rest of the key.
-fn sort_sprites<T: Copy>(
-    items: &mut Vec<T>,
-    spare: &mut Vec<T>,
-    counts: &mut Vec<u32>,
-    entries: &mut Vec<SortEntry>,
-    key: impl Fn(&T) -> (DrawOrder, u32, u32),
-) {
-    sort_by_order(items, spare, counts, entries, |item| key(item).0);
-    let mut start = 0;
-    while start < items.len() {
-        let order = key(&items[start]).0;
-        let len = items[start..]
-            .iter()
-            .take_while(|item| key(item).0 == order)
-            .count();
-        stable_sort_by_key(&mut items[start..start + len], entries, &key);
-        start += len;
-    }
 }
 
 /// Sorts `items` by `key`, keeping the order of equal keys, without allocating once `entries`
@@ -1172,41 +1159,29 @@ mod tests {
         let (mut spare, mut counts, mut entries) = (Vec::new(), Vec::new(), Vec::new());
         // Frames of different sizes in a row, with the same scratch: a short one after a long one
         // finds the long one's items in the spare vector. The last orders are far too big to count.
-        for (len, orders) in [
-            (5000, 7),
-            (17, 3),
-            (0, 1),
-            (3000, 2000),
-            (1, 1),
-            (500, 900),
-            (40, 1_000_000),
+        for (len, orders, textures) in [
+            (5000, 7, 1),
+            (17, 3, 2),
+            (0, 1, 1),
+            (3000, 2000, 1),
+            (1, 1, 1),
+            (500, 900, 3),
+            (40, 1_000_000, 1),
+            (6000, 4, 2),
         ] {
-            let items: Vec<(u32, usize)> = (0..len).map(|index| (next(orders), index)).collect();
-            let mut expected = items.clone();
-            expected.sort_by_key(|item| item.0);
-            let mut sorted = items;
-            sort_by_order(&mut sorted, &mut spare, &mut counts, &mut entries, |item| {
-                item.0
-            });
-            assert_eq!(sorted, expected, "{len} items of {orders} orders");
-        }
-    }
-
-    #[test]
-    fn sprites_match_a_stable_sort_by_order_texture_and_tile() {
-        let mut next = random(0x1234_5678);
-        let (mut spare, mut counts, mut entries) = (Vec::new(), Vec::new(), Vec::new());
-        for len in [0, 1, 9, 400, 6000] {
-            let items: Vec<(u32, u32, u32, usize)> = (0..len)
-                .map(|index| (next(4), next(2), next(30), index))
+            let items: Vec<(u32, u32, usize)> = (0..len)
+                .map(|index| (next(orders), next(textures), index))
                 .collect();
             let mut expected = items.clone();
-            expected.sort_by_key(|item| (item.0, item.1, item.2));
+            expected.sort_by_key(|item| (item.0, item.1));
             let mut sorted = items;
-            sort_sprites(&mut sorted, &mut spare, &mut counts, &mut entries, |item| {
-                (item.0, item.1, item.2)
+            sort_by_order(&mut sorted, &mut spare, &mut counts, &mut entries, |item| {
+                (item.0, item.1)
             });
-            assert_eq!(sorted, expected, "{len} sprites");
+            assert_eq!(
+                sorted, expected,
+                "{len} items of {orders} orders and {textures} textures"
+            );
         }
     }
 
@@ -1239,7 +1214,7 @@ mod tests {
     }
 
     #[test]
-    fn sprites_of_one_order_are_grouped_by_texture() {
+    fn sprites_of_one_order_are_grouped_by_texture_and_keep_their_insertion_order() {
         let tile = |texture: u32, tile: u32| AtlasTile {
             texture_id: AtlasTextureId {
                 index: texture,
@@ -1273,7 +1248,7 @@ mod tests {
             .iter()
             .map(|sprite| (sprite.tile.texture_id.index, sprite.tile.tile_id.0))
             .collect();
-        assert_eq!(sorted, [(0, 2), (0, 5), (1, 2), (1, 5), (1, 5)]);
+        assert_eq!(sorted, [(0, 5), (0, 2), (1, 5), (1, 2), (1, 5)]);
     }
 
     #[test]
