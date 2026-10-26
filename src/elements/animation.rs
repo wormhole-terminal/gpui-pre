@@ -1,10 +1,12 @@
+// Modified by the Wormhole project (wormhole-terminal/gpui-pre), see NOTICE.
+
 use scheduler::Instant;
 use std::{cell::Cell, rc::Rc, time::Duration};
 
 use crate::{
-    AnyElement, App, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement,
-    ParentElement, SpringAnimation, SpringConfig, SpringPlayback, SpringState, SpringTarget,
-    Window,
+    AnyElement, App, Element, ElementId, EntityId, GlobalElementId, InspectorElementId,
+    IntoElement, ParentElement, SpringAnimation, SpringConfig, SpringPlayback, SpringState,
+    SpringTarget, Window,
 };
 
 pub use easing::*;
@@ -63,9 +65,10 @@ impl Animation {
     }
 
     /// Limit how often this animation re-renders. Instead of re-rendering on
-    /// every frame, the animation schedules its next render `1 / max_fps`
-    /// seconds after the current one. Values that are not finite and positive
-    /// are ignored.
+    /// every frame, the animation re-renders on the display frame nearest to
+    /// `1 / max_fps` seconds after the frame it last rendered in, so its
+    /// frames stay evenly spaced. Values that are not finite and positive are
+    /// ignored.
     pub fn with_max_fps(mut self, max_fps: f32) -> Self {
         self.max_fps = Some(max_fps);
         self
@@ -234,9 +237,99 @@ impl<E: IntoElement + 'static> IntoElement for AnimationElement<E> {
 struct AnimationState {
     start: Instant,
     animation_ix: usize,
-    /// Whether a throttled re-render (see [`Animation::with_max_fps`]) is
-    /// already scheduled, so overlapping renders don't stack extra timers.
-    delayed_frame_pending: Rc<Cell<bool>>,
+    /// When a throttled animation (see [`Animation::with_max_fps`]) renders next.
+    throttle: Rc<Throttle>,
+}
+
+/// A throttled animation's clock (see [`Animation::with_max_fps`]).
+///
+/// A timer sleeps through the frames that are surely too early, then a chain of
+/// next-frame callbacks watches the last few without drawing and notifies the
+/// view on the one nearest the due time. A timer alone would wake between frames
+/// and leave the render to wait for the next one, so the gaps between rendered
+/// frames would vary by a whole refresh and the motion stutter; callbacks alone
+/// would wake the main thread on every frame.
+struct Throttle {
+    /// Whether the chain of next-frame callbacks is running.
+    waiting: Cell<bool>,
+    /// When the animation should render next.
+    due: Cell<Option<Instant>>,
+    /// The latest frame the chain saw.
+    last_frame: Cell<Option<Instant>>,
+    /// The display's refresh interval, measured between consecutive frames of the chain.
+    refresh: Cell<Duration>,
+}
+
+impl Throttle {
+    /// The refresh interval assumed until one is measured: 120 Hz, the fastest
+    /// common display, so the first wait is at most a short frame off.
+    const DEFAULT_REFRESH: Duration = Duration::from_micros(8_333);
+    /// A longer gap between the chain's frames is idle time, not a refresh.
+    const LONGEST_REFRESH: Duration = Duration::from_millis(50);
+
+    fn new() -> Self {
+        Self {
+            waiting: Cell::new(false),
+            due: Cell::new(None),
+            last_frame: Cell::new(None),
+            refresh: Cell::new(Self::DEFAULT_REFRESH),
+        }
+    }
+
+    /// Schedules the next render `interval` after the frame this render belongs to.
+    fn schedule(self: &Rc<Self>, interval: Duration, window: &Window, cx: &App) {
+        let now = cx.background_executor().now();
+        // The chain's callback runs just before the draw of the frame it saw, so a
+        // render within a refresh of it is part of that frame. Measuring from the
+        // frame rather than from now keeps the schedule clear of the time drawing
+        // takes, and lets animations that render together stay together.
+        let frame = match self.last_frame.get() {
+            Some(frame) if now.saturating_duration_since(frame) < self.refresh.get() => frame,
+            _ => now,
+        };
+        self.due.set(Some(frame + interval));
+        if self.waiting.replace(true) {
+            return;
+        }
+        let view = window.current_view();
+        // Two refreshes short of the due time: a timer's slack stays clear of it,
+        // and the chain sees two frames in a row to measure the refresh by. A
+        // later render only moves the due time on, so waking early is safe.
+        let sleep = interval.saturating_sub(self.refresh.get() * 2);
+        if sleep.is_zero() {
+            Rc::clone(self).wait(view, None, window);
+            return;
+        }
+        let this = Rc::clone(self);
+        window
+            .spawn(cx, async move |cx| {
+                cx.background_executor().timer(sleep).await;
+                cx.update(move |window, _| this.wait(view, None, window)).ok();
+            })
+            .detach();
+    }
+
+    /// Watches the next frame; `previous` is the frame the chain saw just before.
+    fn wait(self: Rc<Self>, view: EntityId, previous: Option<Instant>, window: &Window) {
+        window.on_next_frame(move |window, cx| {
+            let now = cx.background_executor().now();
+            self.last_frame.set(Some(now));
+            if let Some(previous) = previous {
+                let gap = now.saturating_duration_since(previous);
+                if !gap.is_zero() && gap <= Self::LONGEST_REFRESH {
+                    self.refresh.set(gap);
+                }
+            }
+            // This frame, unless the next one is nearer the due time.
+            let due = self.due.get().is_none_or(|due| now + self.refresh.get() / 2 >= due);
+            if due {
+                self.waiting.set(false);
+                cx.notify(view);
+            } else {
+                self.wait(view, Some(now), window);
+            }
+        });
+    }
 }
 
 struct SpringElementState {
@@ -402,7 +495,7 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
             let mut state = state.unwrap_or_else(|| AnimationState {
                 start: Instant::now(),
                 animation_ix: 0,
-                delayed_frame_pending: Rc::new(Cell::new(false)),
+                throttle: Rc::new(Throttle::new()),
             });
             let (animation_ix, delta, done) = if cx.reduce_motion() {
                 let animation_ix = self.animations.len() - 1;
@@ -451,19 +544,8 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
             if !done {
                 match self.animations[animation_ix].max_fps {
                     Some(max_fps) if max_fps.is_finite() && max_fps > 0.0 => {
-                        if !state.delayed_frame_pending.get() {
-                            state.delayed_frame_pending.set(true);
-                            let delayed_frame_pending = state.delayed_frame_pending.clone();
-                            let view = window.current_view();
-                            let interval = Duration::from_secs_f32(1.0 / max_fps);
-                            window
-                                .spawn(cx, async move |cx| {
-                                    cx.background_executor().timer(interval).await;
-                                    delayed_frame_pending.set(false);
-                                    cx.update(move |_, cx| cx.notify(view)).ok();
-                                })
-                                .detach();
-                        }
+                        let interval = Duration::from_secs_f32(1.0 / max_fps);
+                        state.throttle.schedule(interval, window, cx);
                     }
                     _ => window.request_animation_frame(),
                 }
@@ -931,35 +1013,35 @@ mod tests {
     }
 
     #[gpui::test]
-    fn test_max_fps_schedules_timer_driven_frames(cx: &mut TestAppContext) {
+    fn test_max_fps_renders_on_the_frame_nearest_its_due_time(cx: &mut TestAppContext) {
         let (rendered_deltas, window) = open_test_window_with_max_fps(cx, Some(10.0));
+        assert_eq!(rendered_deltas.borrow().len(), 1);
+
+        // A 100 Hz display: frames every 10 ms. The animation renders every
+        // tenth frame, on the frame itself rather than between frames.
+        let mut rendered_on = Vec::new();
+        let mut watched = 0;
+        for frame in 1..=25 {
+            cx.executor().advance_clock(Duration::from_millis(10));
+            cx.run_until_parked();
+            watched += simulate_next_frame(&window, cx);
+            if rendered_deltas.borrow().len() > rendered_on.len() + 1 {
+                rendered_on.push(frame);
+            }
+        }
+        assert_eq!(rendered_on, [10, 20]);
+        // It sleeps through most frames and watches only the last few before each render.
+        assert!((2..=6).contains(&watched), "watched {watched} frames");
 
         // The test scheduler's clock jitters forward slightly on each poll,
-        // so compare against expectations loosely.
-        let assert_deltas_approx_eq = |expected: &[f32]| {
-            let actual = rendered_deltas.borrow();
-            assert_eq!(actual.len(), expected.len(), "deltas: {actual:?}");
-            for (actual, expected) in actual.iter().zip(expected) {
-                assert!(
-                    (actual - expected).abs() < 1e-2,
-                    "expected {expected}, got {actual}"
-                );
-            }
-        };
-
-        assert_deltas_approx_eq(&[0.0]);
-
-        // No per-frame callback is scheduled; re-renders are timer-driven.
-        assert_eq!(simulate_next_frame(&window, cx), 0);
-        assert_deltas_approx_eq(&[0.0]);
-
-        cx.executor().advance_clock(Duration::from_millis(105));
-        cx.run_until_parked();
-        assert_deltas_approx_eq(&[0.0, 0.105]);
-
-        cx.executor().advance_clock(Duration::from_millis(105));
-        cx.run_until_parked();
-        assert_deltas_approx_eq(&[0.0, 0.105, 0.21]);
+        // so compare loosely.
+        let deltas = rendered_deltas.borrow();
+        for (actual, expected) in deltas.iter().zip([0.0, 0.1, 0.2]) {
+            assert!(
+                (actual - expected).abs() < 1e-2,
+                "expected {expected}, got {actual}"
+            );
+        }
     }
 
     #[gpui::test]
